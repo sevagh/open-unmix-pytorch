@@ -167,6 +167,7 @@ def load_separator(
     niter: int = 1,
     residual: bool = False,
     wiener_win_len: Optional[int] = 300,
+    chunk_size: Optional[int] = 2621440,
     device: Union[str, torch.device] = "cpu",
     pretrained: bool = True,
     filterbank: str = "torch",
@@ -228,6 +229,7 @@ def load_separator(
             n_fft=enc_conf["nfft"],
             n_hop=enc_conf["nhop"],
             nb_channels=enc_conf["nb_channels"],
+            chunk_size=chunk_size,
             filterbank=filterbank,
         ).to(device)
 

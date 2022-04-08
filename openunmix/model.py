@@ -1,7 +1,9 @@
 from typing import Optional
 
+import sys
 import torch
 import torch.nn as nn
+from tqdm import trange
 import torch.nn.functional as F
 from torch import Tensor
 from torch.nn import LSTM, BatchNorm1d, Linear, Parameter
@@ -186,6 +188,15 @@ class Separator(nn.Module):
             localization of sources.
             None means not batching but using the whole signal. It comes at the
             price of a much larger memory usage.
+        chunk_size (int or None): The size to split the input song into. The
+            separation is performed on each chunk including the Wiener-EM step,
+            and the final full song is concatenated from the chunks.
+            The default value is 2621440 samples, or ~60 seconds @ 44100 Hz fs.
+            This should help deal with the high memory use of Wiener-EM, e.g.:
+                https://github.com/sigsep/open-unmix-pytorch/issues/113
+                https://github.com/sigsep/open-unmix-pytorch/issues/7
+            X-UMX has a chunk-dur argument which is similar:
+            https://github.com/sony/ai-research-code/blob/ab5e896db279db8c704e56423a9ccf6687adf46b/x-umx/test.py#L163
         filterbank (str): filterbank implementation method.
             Supported are `['torch', 'asteroid']`. `torch` is about 30% faster
             compared to `asteroid` on large FFT sizes such as 4096. However,
@@ -204,6 +215,7 @@ class Separator(nn.Module):
         n_hop: int = 1024,
         nb_channels: int = 2,
         wiener_win_len: Optional[int] = 300,
+        chunk_size: Optional[int] = 2621440,
         filterbank: str = "torch",
     ):
         super(Separator, self).__init__()
@@ -213,6 +225,7 @@ class Separator(nn.Module):
         self.residual = residual
         self.softmask = softmask
         self.wiener_win_len = wiener_win_len
+        self.chunk_size = chunk_size if chunk_size is not None else sys.maxsize
 
         self.stft, self.istft = make_filterbanks(
             n_fft=n_fft,
@@ -238,7 +251,7 @@ class Separator(nn.Module):
             p.requires_grad = False
         self.eval()
 
-    def forward(self, audio: Tensor) -> Tensor:
+    def forward(self, audio_big: Tensor) -> Tensor:
         """Performing the separation on audio input
 
         Args:
@@ -251,71 +264,90 @@ class Separator(nn.Module):
         """
 
         nb_sources = self.nb_targets
-        nb_samples = audio.shape[0]
+        nb_samples = audio_big.shape[0]
+        N = audio_big.shape[-1]
 
-        # getting the STFT of mix:
-        # (nb_samples, nb_channels, nb_bins, nb_frames, 2)
-        mix_stft = self.stft(audio)
-        X = self.complexnorm(mix_stft)
+        nchunks = (N // self.chunk_size)
+        if (N % self.chunk_size) != 0:
+            nchunks += 1
 
-        # initializing spectrograms variable
-        spectrograms = torch.zeros(X.shape + (nb_sources,), dtype=audio.dtype, device=X.device)
+        print(f'n chunks: {nchunks}')
 
-        for j, (target_name, target_module) in enumerate(self.target_models.items()):
-            # apply current model to get the source spectrogram
-            target_spectrogram = target_module(X.detach().clone())
-            spectrograms[..., j] = target_spectrogram
+        estimates = []
 
-        # transposing it as
-        # (nb_samples, nb_frames, nb_bins,{1,nb_channels}, nb_sources)
-        spectrograms = spectrograms.permute(0, 3, 2, 1, 4)
+        for chunk_idx in trange(nchunks):
+            audio = audio_big[..., chunk_idx * self.chunk_size: min((chunk_idx + 1) * self.chunk_size, N)]
+            print(f'audio.shape: {audio.shape}')
 
-        # rearranging it into:
-        # (nb_samples, nb_frames, nb_bins, nb_channels, 2) to feed
-        # into filtering methods
-        mix_stft = mix_stft.permute(0, 3, 2, 1, 4)
+            # getting the STFT of mix:
+            # (nb_samples, nb_channels, nb_bins, nb_frames, 2)
+            mix_stft = self.stft(audio)
+            X = self.complexnorm(mix_stft)
 
-        # create an additional target if we need to build a residual
-        if self.residual:
-            # we add an additional target
-            nb_sources += 1
+            # initializing spectrograms variable
+            spectrograms = torch.zeros(X.shape + (nb_sources,), dtype=audio.dtype, device=X.device)
 
-        if nb_sources == 1 and self.niter > 0:
-            raise Exception(
-                "Cannot use EM if only one target is estimated."
-                "Provide two targets or create an additional "
-                "one with `--residual`"
-            )
+            for j, (target_name, target_module) in enumerate(self.target_models.items()):
+                # apply current model to get the source spectrogram
+                target_spectrogram = target_module(X.detach().clone())
+                spectrograms[..., j] = target_spectrogram
 
-        nb_frames = spectrograms.shape[1]
-        targets_stft = torch.zeros(
-            mix_stft.shape + (nb_sources,), dtype=audio.dtype, device=mix_stft.device
-        )
-        for sample in range(nb_samples):
-            pos = 0
-            if self.wiener_win_len:
-                wiener_win_len = self.wiener_win_len
-            else:
-                wiener_win_len = nb_frames
-            while pos < nb_frames:
-                cur_frame = torch.arange(pos, min(nb_frames, pos + wiener_win_len))
-                pos = int(cur_frame[-1]) + 1
+            # transposing it as
+            # (nb_samples, nb_frames, nb_bins,{1,nb_channels}, nb_sources)
+            spectrograms = spectrograms.permute(0, 3, 2, 1, 4)
 
-                targets_stft[sample, cur_frame] = wiener(
-                    spectrograms[sample, cur_frame],
-                    mix_stft[sample, cur_frame],
-                    self.niter,
-                    softmask=self.softmask,
-                    residual=self.residual,
+            # rearranging it into:
+            # (nb_samples, nb_frames, nb_bins, nb_channels, 2) to feed
+            # into filtering methods
+            mix_stft = mix_stft.permute(0, 3, 2, 1, 4)
+
+            # create an additional target if we need to build a residual
+            if self.residual:
+                # we add an additional target
+                nb_sources += 1
+
+            if nb_sources == 1 and self.niter > 0:
+                raise Exception(
+                    "Cannot use EM if only one target is estimated."
+                    "Provide two targets or create an additional "
+                    "one with `--residual`"
                 )
 
-        # getting to (nb_samples, nb_targets, channel, fft_size, n_frames, 2)
-        targets_stft = targets_stft.permute(0, 5, 3, 2, 1, 4).contiguous()
+            nb_frames = spectrograms.shape[1]
+            targets_stft = torch.zeros(
+                mix_stft.shape + (nb_sources,), dtype=audio.dtype, device=mix_stft.device
+            )
+            for sample in range(nb_samples):
+                pos = 0
+                if self.wiener_win_len:
+                    wiener_win_len = self.wiener_win_len
+                else:
+                    wiener_win_len = nb_frames
+                while pos < nb_frames:
+                    cur_frame = torch.arange(pos, min(nb_frames, pos + wiener_win_len))
+                    pos = int(cur_frame[-1]) + 1
 
-        # inverse STFT
-        estimates = self.istft(targets_stft, length=audio.shape[2])
+                    targets_stft[sample, cur_frame] = wiener(
+                        spectrograms[sample, cur_frame],
+                        mix_stft[sample, cur_frame],
+                        self.niter,
+                        softmask=self.softmask,
+                        residual=self.residual,
+                    )
 
-        return estimates
+            # getting to (nb_samples, nb_targets, channel, fft_size, n_frames, 2)
+            targets_stft = targets_stft.permute(0, 5, 3, 2, 1, 4).contiguous()
+
+            # inverse STFT
+            cur_estimates = self.istft(targets_stft, length=audio.shape[2])
+
+            print(f'cur_estimates: {cur_estimates.shape}')
+            estimates.append(cur_estimates)
+
+        all_ests = torch.cat(estimates, axis=-1)
+        print(f'all ests: {all_ests.shape}')
+
+        return all_ests
 
     def to_dict(self, estimates: Tensor, aggregate_dict: Optional[dict] = None) -> dict:
         """Convert estimates as stacked tensor to dictionary
